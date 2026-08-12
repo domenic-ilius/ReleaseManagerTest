@@ -439,17 +439,17 @@ jobs:
             $changeContext = $changeContext.Substring(0, 60000) + "`n[Remaining changes omitted due to context limit.]"
           }
 
-          $systemPrompt = @"
-You are a release-notes agent. Analyze only the supplied Git commit subjects and diffs.
-Do not invent behavior, product names, issue numbers, performance results, or user impact.
-Return markdown only, with exactly these two top-level headings:
-## Technical Release Notes for Developers
-## Feature Release Notes for Customers
-
-Under the technical heading, summarize implementation details, affected areas, compatibility concerns, and testing or operational notes. Clearly say when information is not present.
-Under the customer heading, describe user-visible improvements in plain language. If a change is not user-visible, say so briefly. Use concise bullets and short paragraphs.
-Make the result polished and easy to scan. Do not include a title, code fences, or a preamble.
-"@
+          $systemPrompt = @(
+            "You are a release-notes agent. Analyze only the supplied Git commit subjects and diffs.",
+            "Do not invent behavior, product names, issue numbers, performance results, or user impact.",
+            "Return markdown only, with exactly these two top-level headings:",
+            "## Technical Release Notes for Developers",
+            "## Feature Release Notes for Customers",
+            "",
+            "Under the technical heading, summarize implementation details, affected areas, compatibility concerns, and testing or operational notes. Clearly say when information is not present.",
+            "Under the customer heading, describe user-visible improvements in plain language. If a change is not user-visible, say so briefly. Use concise bullets and short paragraphs.",
+            "Make the result polished and easy to scan. Do not include a title, code fences, or a preamble."
+          ) -join "`n"
           $userPrompt = "Analyze these code changes for release branch $env:RELEASE_BRANCH (backport status: $env:RELEASE_STATUS):`n`n$changeContext"
           $payload = @{
             model = $env:AI_MODEL
