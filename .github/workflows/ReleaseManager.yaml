@@ -32,7 +32,6 @@ concurrency:
 permissions:
   contents: write
   pull-requests: read
-  models: read
 
 defaults:
   run:
@@ -390,6 +389,43 @@ jobs:
 
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($tableLines -join "`n")
 
+  CleanupPreviewBranches:
+    needs: [BackportToReleaseBranches, AwaitPushApproval, PushToReleaseBranches]
+    if: ${{ always() && inputs.pushChanges && needs.PushToReleaseBranches.result != 'success' && needs.BackportToReleaseBranches.outputs.results != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Delete rejected preview branches
+        env:
+          RESULTS: ${{ needs.BackportToReleaseBranches.outputs.results }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          $results = $env:RESULTS | ConvertFrom-Json
+          $deleted = [System.Collections.Generic.List[string]]::new()
+          foreach ($entry in @($results)) {
+            if (-not $entry.previewBranch) {
+              continue
+            }
+            $previewBranch = "$($entry.previewBranch)"
+            $deleteOutput = & git push origin --delete $previewBranch 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              $deleted.Add($previewBranch)
+            }
+            elseif (($deleteOutput -join "`n") -notmatch "remote ref does not exist|Reference does not exist|unable to delete") {
+              throw "Unable to delete preview branch '$previewBranch': $($deleteOutput -join "`n")"
+            }
+          }
+          if ($deleted.Count -gt 0) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "### Preview cleanup`nDeleted preview branches after approval was rejected or push was skipped/failed:`n$($deleted -join "`n")"
+          }
+          else {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "### Preview cleanup`nNo remaining preview branches were found."
+          }
+
   ReleaseNotes:
     needs: [BackportToReleaseBranches]
     if: ${{ always() && inputs.generateReleaseNotes }}
@@ -410,7 +446,9 @@ jobs:
           RELEASE_BRANCH: ${{ matrix.release.branch }}
           RELEASE_STATUS: ${{ matrix.release.status }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AI_MODEL: openai/gpt-4o-mini
+          AI_ENDPOINT: ${{ secrets.RELEASE_NOTES_AI_ENDPOINT }}
+          AI_API_KEY: ${{ secrets.RELEASE_NOTES_AI_API_KEY }}
+          AI_MODEL: ${{ vars.RELEASE_NOTES_AI_MODEL }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
           $mergeCommits = $env:MERGE_COMMITS.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)
@@ -461,16 +499,44 @@ jobs:
             max_tokens = 3000
           } | ConvertTo-Json -Depth 8
 
-          $aiResponse = Invoke-RestMethod -Uri "https://models.github.ai/inference/chat/completions" -Method Post -Headers @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept = "application/vnd.github+json"
-          } -ContentType "application/json" -Body $payload
-          $aiNotes = "$($aiResponse.choices[0].message.content)".Trim()
-          if (-not $aiNotes) {
-            throw "The AI release-notes agent returned an empty response."
+          $aiNotes = ""
+          if ($env:AI_ENDPOINT -and $env:AI_API_KEY -and $env:AI_MODEL) {
+            try {
+              $aiResponse = Invoke-RestMethod -Uri $env:AI_ENDPOINT -Method Post -Headers @{
+                Authorization = "Bearer $env:AI_API_KEY"
+                Accept = "application/json"
+              } -ContentType "application/json" -Body $payload
+              $aiNotes = "$($aiResponse.choices[0].message.content)".Trim()
+            }
+            catch {
+              Write-Warning "The configured release-notes AI endpoint was unavailable. Using the factual fallback: $($_.Exception.Message)"
+            }
           }
-          if ($aiNotes -notmatch '## Technical Release Notes for Developers' -or $aiNotes -notmatch '## Feature Release Notes for Customers') {
-            throw "The AI release-notes agent returned an unexpected format."
+
+          if (-not $aiNotes -or $aiNotes -notmatch '## Technical Release Notes for Developers' -or $aiNotes -notmatch '## Feature Release Notes for Customers') {
+            $technicalBullets = foreach ($mergeCommit in $mergeCommits) {
+              $subject = (& git show -s --format="%s" $mergeCommit).Trim()
+              $files = @(git diff-tree --no-commit-id --name-only -r $mergeCommit)
+              $fileSummary = if ($files.Count -gt 0) { $files -join ', ' } else { 'No file paths reported.' }
+              "- **$subject** — Commit `$mergeCommit`; affected files: $fileSummary."
+            }
+            $featureBullets = foreach ($mergeCommit in $mergeCommits) {
+              $subject = (& git show -s --format="%s" $mergeCommit).Trim()
+              "- $subject (user-facing impact was not determined because the AI service was unavailable.)"
+            }
+            $aiNotes = @(
+              "## Technical Release Notes for Developers",
+              "",
+              "> AI analysis was unavailable; this section is a factual commit-based summary and requires review.",
+              "",
+              $technicalBullets,
+              "",
+              "## Feature Release Notes for Customers",
+              "",
+              "> Customer-facing impact requires review because AI analysis was unavailable.",
+              "",
+              $featureBullets
+            ) -join "`n"
           }
 
           $aiNotesPath = Join-Path $env:GITHUB_WORKSPACE "ai-release-notes.md"
@@ -571,7 +637,7 @@ jobs:
           if-no-files-found: error
 
   FinalStatus:
-    needs: [BackportToReleaseBranches, AwaitPushApproval, PushToReleaseBranches, ReleaseNotes]
+    needs: [BackportToReleaseBranches, AwaitPushApproval, PushToReleaseBranches, CleanupPreviewBranches, ReleaseNotes]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
