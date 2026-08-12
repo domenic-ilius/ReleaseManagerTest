@@ -1,0 +1,458 @@
+name: "Release manager"
+run-name: "Release manager"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mergeCommits:
+        description: "Merge commit SHAs from main (space/comma/newline separated)"
+        required: true
+        type: string
+      releaseBranches:
+        description: "Release branches to backport to (space/comma/newline separated)"
+        required: true
+        default: "release/28.0,release/27.1,release/26.4,release/25.9"
+        type: string
+      pushChanges:
+        description: "Prepare preview branches and require approval before pushing to release branches"
+        required: true
+        default: true
+        type: boolean
+
+      generateReleaseNotes:
+        description: "Generate release notes markdown artifact"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-manager
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  BackportToReleaseBranches:
+    runs-on: ubuntu-latest
+    outputs:
+      selectedBranches: ${{ steps.selectBranches.outputs.selectedBranches }}
+      mergeCommits: ${{ steps.parseMergeCommits.outputs.mergeCommits }}
+      results: ${{ steps.backport.outputs.results }}
+      hadFailures: ${{ steps.backport.outputs.hadFailures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Select target branches
+        id: selectBranches
+        env:
+          RAW_RELEASE_BRANCHES: ${{ inputs.releaseBranches }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          $tokens = ($env:RAW_RELEASE_BRANCHES -replace ',', ' ' -replace "`r", ' ' -replace "`n", ' ' -replace "`t", ' ').Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $branches = [System.Collections.Generic.List[string]]::new()
+          foreach ($token in $tokens) {
+            $branch = $token.Trim()
+            if (-not $branch) {
+              continue
+            }
+            if ($branch -notlike "release/*") {
+              throw "Invalid branch '$branch'. Only release/* branches are allowed."
+            }
+            if ($seen.Add($branch)) {
+              $branches.Add($branch)
+            }
+          }
+
+          if ($branches.Count -eq 0) {
+            throw "No target release branches were selected."
+          }
+
+          function Get-BranchVersionParts {
+            param([string]$branchName)
+            if ($branchName -notmatch '^release\/([0-9]+(?:\.[0-9]+)*)$') {
+              throw "Invalid release branch format '$branchName'. Expected release/<version>."
+            }
+            return $Matches[1].Split('.') | ForEach-Object { [int]$_ }
+          }
+
+          $sorted = $branches | Sort-Object -Stable -Property @{
+            Expression = {
+              $parts = Get-BranchVersionParts $_
+              ($parts | ForEach-Object { $_.ToString("D6") }) -join '.'
+            }
+          }
+
+          $selected = ($sorted -join ",")
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "selectedBranches=$selected"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "### Target branches (processing order: lowest to highest)`n$($sorted -join "`n")`n"
+
+      - name: Parse and validate merge commits
+        id: parseMergeCommits
+        env:
+          RAW_MERGE_COMMITS: ${{ inputs.mergeCommits }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $tokens = ($env:RAW_MERGE_COMMITS -replace ',', ' ' -replace "`r", ' ' -replace "`n", ' ' -replace "`t", ' ').Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          if ($tokens.Count -eq 0) {
+            throw "No merge commit SHAs were provided."
+          }
+
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $mergeCommits = [System.Collections.Generic.List[string]]::new()
+          foreach ($token in $tokens) {
+            $sha = $token.Trim()
+            if (-not $sha) {
+              continue
+            }
+            if (-not $seen.Add($sha)) {
+              continue
+            }
+
+            & git cat-file -e "$sha^{commit}"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Commit '$sha' does not exist in this repository."
+            }
+
+            $parentLine = (& git rev-list --parents -n 1 $sha).Trim()
+            if (-not $parentLine) {
+              throw "Unable to inspect parents for commit '$sha'."
+            }
+
+            $parts = $parentLine.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+            if ($parts.Count -lt 3) {
+              throw "Commit '$sha' is not a merge commit."
+            }
+
+            & git merge-base --is-ancestor $sha origin/main
+            if ($LASTEXITCODE -ne 0) {
+              throw "Commit '$sha' is not reachable from origin/main."
+            }
+
+            $mergeCommits.Add($sha)
+          }
+
+          $ordered = foreach ($sha in $mergeCommits) {
+            $subject = (& git show -s --format="%s" $sha).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to inspect subject for commit '$sha'."
+            }
+            $prId = -1
+            if ($subject -match '#([0-9]+)\b') {
+              $prId = [int]$Matches[1]
+            }
+            [PSCustomObject]@{
+              sha = $sha
+              prId = $prId
+            }
+          } | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $true }
+
+          $sortedMergeCommits = @($ordered.sha)
+
+          $commitList = $sortedMergeCommits -join ","
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "mergeCommits=$commitList"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "### Merge commits (sorted by PR ID descending)`n$($sortedMergeCommits -join "`n")`n"
+
+      - name: Cherry-pick merge commits
+        id: backport
+        env:
+          SELECTED_BRANCHES: ${{ steps.selectBranches.outputs.selectedBranches }}
+          MERGE_COMMITS: ${{ steps.parseMergeCommits.outputs.mergeCommits }}
+          PUSH_CHANGES: ${{ inputs.pushChanges }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $branches = $env:SELECTED_BRANCHES.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)
+          $mergeCommits = $env:MERGE_COMMITS.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)
+          $pushChanges = [System.Convert]::ToBoolean($env:PUSH_CHANGES)
+          $results = @()
+          $hadFailures = $false
+
+          foreach ($branch in $branches) {
+            & git fetch --no-tags origin $branch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to fetch branch '$branch' from origin."
+            }
+
+            & git rev-parse --verify "refs/remotes/origin/$branch"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Release branch '$branch' does not exist on origin."
+            }
+
+            $workBranch = "release-manager/" + ($branch -replace '/', '-')
+            & git checkout -B $workBranch "origin/$branch"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to checkout '$branch'."
+            }
+
+            $applied = [System.Collections.Generic.List[string]]::new()
+            $skipped = [System.Collections.Generic.List[string]]::new()
+            $status = "success"
+            $failureMessage = ""
+            $previewBranch = ""
+
+            foreach ($mergeCommit in $mergeCommits) {
+              $cherryPickOutput = & git cherry-pick -m 1 $mergeCommit 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $joinedOutput = $cherryPickOutput -join "`n"
+                if ($joinedOutput -match "previous cherry-pick is now empty" -or $joinedOutput -match "nothing to commit") {
+                  $skipOutput = & git cherry-pick --skip 2>&1
+                  if ($LASTEXITCODE -ne 0) {
+                    throw "Cherry-pick of '$mergeCommit' on '$branch' was empty, but skip failed: $($skipOutput -join "`n")"
+                  }
+                  $skipped.Add($mergeCommit)
+                  continue
+                }
+
+                $abortOutput = & git cherry-pick --abort 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Cherry-pick failed for '$mergeCommit' on '$branch' and abort also failed: $($abortOutput -join "`n")"
+                }
+                $status = "failed"
+                $failureMessage = "Conflict while cherry-picking $mergeCommit on $branch.`n$joinedOutput"
+                $hadFailures = $true
+                break
+              }
+
+              $applied.Add($mergeCommit)
+            }
+
+            if ($status -eq "success" -and $applied.Count -gt 0 -and $pushChanges) {
+              $previewBranch = "release-manager/preview/$($env:GITHUB_RUN_ID)/" + ($branch -replace '/', '-')
+              & git push origin "HEAD:$previewBranch"
+              if ($LASTEXITCODE -ne 0) {
+                $status = "failed"
+                $failureMessage = "Cherry-picks succeeded on $branch, but pushing preview branch '$previewBranch' failed."
+                $hadFailures = $true
+              }
+            }
+
+            $result = [PSCustomObject]@{
+              branch = $branch
+              status = $status
+              applied = $applied
+              skipped = $skipped
+              pushed = $false
+              previewBranch = $previewBranch
+              readyForPush = ($status -eq "success" -and $applied.Count -gt 0 -and $pushChanges -and $previewBranch -ne "")
+              failure = $failureMessage
+            }
+            $results += $result
+          }
+
+          if ($hadFailures) {
+            foreach ($entry in $results) {
+              if ($entry.previewBranch) {
+                & git push origin --delete $entry.previewBranch 2>&1 | Out-Null
+              }
+            }
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Preview cleanup`nPreview branches were removed because at least one target branch failed."
+          }
+
+          $tableLines = @(
+            "### Backport result",
+            "",
+            "| Branch | Status | Applied | Skipped | Preview branch | Ready for push |",
+            "| --- | --- | ---: | ---: | --- | --- |"
+          )
+          foreach ($entry in $results) {
+            $preview = if ($entry.previewBranch) { $entry.previewBranch } else { "-" }
+            $tableLines += "| $($entry.branch) | $($entry.status) | $($entry.applied.Count) | $($entry.skipped.Count) | $preview | $($entry.readyForPush) |"
+          }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($tableLines -join "`n")
+
+          foreach ($entry in $results) {
+            if ($entry.failure) {
+              Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n#### $($entry.branch) failure`n$($entry.failure)`n"
+            }
+          }
+
+          if ($pushChanges -and -not $hadFailures) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Manual approval required before pushing`nReview each preview branch in this run, then approve the 'release-push-approval' environment to continue."
+          }
+
+          $resultsJson = $results | ConvertTo-Json -Depth 8 -Compress
+          $encodedResults = $resultsJson -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "results=$encodedResults"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "hadFailures=$hadFailures"
+
+  AwaitPushApproval:
+    needs: [BackportToReleaseBranches]
+    if: ${{ inputs.pushChanges && needs.BackportToReleaseBranches.outputs.hadFailures != 'true' && contains(needs.BackportToReleaseBranches.outputs.results, '"readyForPush":true') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: release-push-approval
+    steps:
+      - name: Awaiting manual approval
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          Write-Host "Review preview branches in the Backport summary and approve this environment to push to release branches."
+
+  PushToReleaseBranches:
+    needs: [BackportToReleaseBranches, AwaitPushApproval]
+    if: ${{ inputs.pushChanges && needs.BackportToReleaseBranches.outputs.hadFailures != 'true' && contains(needs.BackportToReleaseBranches.outputs.results, '"readyForPush":true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Push approved preview branches
+        env:
+          RESULTS: ${{ needs.BackportToReleaseBranches.outputs.results }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          if (-not $env:RESULTS) {
+            throw "No backport results were found for push."
+          }
+          $results = $env:RESULTS | ConvertFrom-Json
+          $tableLines = @(
+            "### Push result",
+            "",
+            "| Branch | Preview branch | Pushed |",
+            "| --- | --- | --- |"
+          )
+
+          foreach ($entry in $results) {
+            if (-not $entry.readyForPush) {
+              continue
+            }
+
+            $branch = "$($entry.branch)"
+            $previewBranch = "$($entry.previewBranch)"
+            if (-not $previewBranch) {
+              throw "Entry for '$branch' was marked readyForPush but has no preview branch."
+            }
+
+            & git fetch --no-tags origin $previewBranch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to fetch preview branch '$previewBranch'."
+            }
+
+            $workBranch = "release-manager/final/" + ($branch -replace '/', '-')
+            & git checkout -B $workBranch "origin/$previewBranch"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to checkout preview branch '$previewBranch'."
+            }
+
+            & git push origin "HEAD:$branch"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to push approved changes to '$branch'."
+            }
+
+            $tableLines += "| $branch | $previewBranch | true |"
+          }
+
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($tableLines -join "`n")
+
+  ReleaseNotes:
+    needs: [BackportToReleaseBranches]
+    if: ${{ always() && inputs.generateReleaseNotes }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Build release notes markdown
+        env:
+          MERGE_COMMITS: ${{ needs.BackportToReleaseBranches.outputs.mergeCommits }}
+          RESULTS: ${{ needs.BackportToReleaseBranches.outputs.results }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          if (-not $env:RESULTS) {
+            throw "Backport results were not available for release note generation."
+          }
+
+          $results = $env:RESULTS | ConvertFrom-Json
+          $mergeCommits = $env:MERGE_COMMITS.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)
+          $notesPath = Join-Path $env:GITHUB_WORKSPACE "release-notes.md"
+          $now = [DateTimeOffset]::UtcNow.ToString("yyyy-MM-dd HH:mm 'UTC'")
+
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $lines.Add("# Release backport notes")
+          $lines.Add("")
+          $lines.Add("Generated: $now")
+          $lines.Add("")
+          $lines.Add("## Commits selected from main")
+          $lines.Add("")
+          foreach ($mergeCommit in $mergeCommits) {
+            $subject = (& git show -s --format="%s" $mergeCommit).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to read commit subject for '$mergeCommit'."
+            }
+            $lines.Add("- `$mergeCommit` $subject")
+          }
+          $lines.Add("")
+
+          foreach ($entry in $results) {
+            $lines.Add("## $($entry.branch)")
+            $lines.Add("")
+            $lines.Add("- Status: **$($entry.status)**")
+            $lines.Add("- Applied: $($entry.applied.Count)")
+            $lines.Add("- Skipped: $($entry.skipped.Count)")
+            $lines.Add("- Ready for push: $($entry.readyForPush)")
+            if ($entry.previewBranch) {
+              $lines.Add("- Preview branch: $($entry.previewBranch)")
+            }
+            if ($entry.failure) {
+              $lines.Add("")
+              $lines.Add("### Failure details")
+              $lines.Add("```text")
+              $lines.Add("$($entry.failure)")
+              $lines.Add("```")
+            }
+            $lines.Add("")
+          }
+
+          [System.IO.File]::WriteAllLines($notesPath, $lines)
+          Get-Content -Path $notesPath | Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload release notes artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-backport-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  FinalStatus:
+    needs: [BackportToReleaseBranches, AwaitPushApproval, PushToReleaseBranches, ReleaseNotes]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail workflow if backport or push failed
+        env:
+          HAD_FAILURES: ${{ needs.BackportToReleaseBranches.outputs.hadFailures }}
+          PUSH_RESULT: ${{ needs.PushToReleaseBranches.result }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          if ($env:HAD_FAILURES -eq "true") {
+            throw "One or more release branches failed during cherry-pick. See workflow summary and release-notes artifact."
+          }
+          if ($env:PUSH_RESULT -eq "failure") {
+            throw "Push to one or more release branches failed after approval."
+          }
