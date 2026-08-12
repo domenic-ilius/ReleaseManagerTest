@@ -161,6 +161,7 @@ jobs:
               [PSCustomObject]@{
                 sha = $sha
                 prId = $prId
+                subject = $subject
               }
             }
           ) | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $false }
