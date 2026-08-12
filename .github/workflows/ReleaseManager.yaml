@@ -163,13 +163,25 @@ jobs:
                 prId = $prId
               }
             }
-          ) | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $true }
+          ) | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $false }
 
           $sortedMergeCommits = @($ordered.sha)
 
           $commitList = $sortedMergeCommits -join ","
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "mergeCommits=$commitList"
-          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "### Merge commits (sorted by PR ID descending)`n$($sortedMergeCommits -join "`n")`n"
+          $commitSummaryLines = @(
+            "### Merge commits (sorted by PR ID ascending)",
+            "",
+            "| PR | Merge commit | SHA |",
+            "| ---: | --- | --- |"
+          )
+          foreach ($commit in $ordered) {
+            $safeSubject = "$($commit.subject)" -replace '\|', '\\|'
+            $prLabel = if ($commit.prId -ge 0) { "#$($commit.prId)" } else { "-" }
+            $commitSummaryLines += "| $prLabel | $safeSubject | $($commit.sha) |"
+          }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($commitSummaryLines -join "`n")
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ""
 
       - name: Cherry-pick merge commits
         id: backport
@@ -334,8 +346,8 @@ jobs:
           $tableLines = @(
             "### Push result",
             "",
-            "| Branch | Preview branch | Pushed |",
-            "| --- | --- | --- |"
+            "| Branch | Preview branch | Pushed | Preview deleted |",
+            "| --- | --- | --- | --- |"
           )
 
           foreach ($entry in $results) {
@@ -365,7 +377,12 @@ jobs:
               throw "Failed to push approved changes to '$branch'."
             }
 
-            $tableLines += "| $branch | $previewBranch | true |"
+            $deleteOutput = & git push origin --delete $previewBranch 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "Changes were pushed to '$branch', but deleting preview branch '$previewBranch' failed: $($deleteOutput -join "`n")"
+            }
+
+            $tableLines += "| $branch | $previewBranch | true | true |"
           }
 
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($tableLines -join "`n")
@@ -407,7 +424,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "Unable to read commit subject for '$mergeCommit'."
             }
-            $lines.Add("- `$mergeCommit` $subject")
+            $lines.Add('- `{0}` {1}' -f $mergeCommit, $subject)
           }
           $lines.Add("")
 
@@ -424,9 +441,9 @@ jobs:
             if ($entry.failure) {
               $lines.Add("")
               $lines.Add("### Failure details")
-              $lines.Add("```text")
+              $lines.Add('```text')
               $lines.Add("$($entry.failure)")
-              $lines.Add("```")
+              $lines.Add('```')
             }
             $lines.Add("")
           }
