@@ -32,6 +32,7 @@ concurrency:
 permissions:
   contents: write
   pull-requests: read
+  models: read
 
 defaults:
   run:
@@ -260,6 +261,7 @@ jobs:
 
             $result = [PSCustomObject]@{
               branch = $branch
+              artifactName = ($branch -replace '[^A-Za-z0-9._-]', '-')
               status = $status
               applied = $applied
               skipped = $skipped
@@ -302,7 +304,7 @@ jobs:
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Manual approval required before pushing`nReview each preview branch in this run, then approve the 'release-push-approval' environment to continue."
           }
 
-          $resultsJson = $results | ConvertTo-Json -Depth 8 -Compress
+          $resultsJson = @($results) | ConvertTo-Json -Depth 8 -Compress
           $encodedResults = $resultsJson -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "results=$encodedResults"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "hadFailures=$hadFailures"
@@ -392,11 +394,100 @@ jobs:
     needs: [BackportToReleaseBranches]
     if: ${{ always() && inputs.generateReleaseNotes }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ${{ fromJSON(needs.BackportToReleaseBranches.outputs.results) }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+
+      - name: Analyze code changes with AI
+        env:
+          MERGE_COMMITS: ${{ needs.BackportToReleaseBranches.outputs.mergeCommits }}
+          RELEASE_BRANCH: ${{ matrix.release.branch }}
+          RELEASE_STATUS: ${{ matrix.release.status }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_MODEL: openai/gpt-4o-mini
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          $mergeCommits = $env:MERGE_COMMITS.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)
+          if ($mergeCommits.Count -eq 0) {
+            throw "No merge commits were available for AI release-note generation."
+          }
+
+          $changeSections = [System.Collections.Generic.List[string]]::new()
+          foreach ($mergeCommit in $mergeCommits) {
+            $subject = (& git show -s --format="%s" $mergeCommit).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to read commit subject for '$mergeCommit'."
+            }
+            $changes = (& git diff "$mergeCommit^1" $mergeCommit -- . | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to read code changes for '$mergeCommit'."
+            }
+            if (-not $changes) {
+              $changes = "(No file changes were found.)"
+            }
+            $changeSections.Add("Commit: $mergeCommit`nSubject: $subject`nChanges:`n$changes")
+          }
+
+          $changeContext = $changeSections -join "`n`n---`n`n"
+          if ($changeContext.Length -gt 60000) {
+            $changeContext = $changeContext.Substring(0, 60000) + "`n[Remaining changes omitted due to context limit.]"
+          }
+
+          $systemPrompt = @"
+You are a release-notes agent. Analyze only the supplied Git commit subjects and diffs.
+Do not invent behavior, product names, issue numbers, performance results, or user impact.
+Return markdown only, with exactly these two top-level headings:
+## Technical Release Notes for Developers
+## Feature Release Notes for Customers
+
+Under the technical heading, summarize implementation details, affected areas, compatibility concerns, and testing or operational notes. Clearly say when information is not present.
+Under the customer heading, describe user-visible improvements in plain language. If a change is not user-visible, say so briefly. Use concise bullets and short paragraphs.
+Make the result polished and easy to scan. Do not include a title, code fences, or a preamble.
+"@
+          $userPrompt = "Analyze these code changes for release branch $env:RELEASE_BRANCH (backport status: $env:RELEASE_STATUS):`n`n$changeContext"
+          $payload = @{
+            model = $env:AI_MODEL
+            messages = @(
+              @{ role = "system"; content = $systemPrompt }
+              @{ role = "user"; content = $userPrompt }
+            )
+            temperature = 0.2
+            max_tokens = 3000
+          } | ConvertTo-Json -Depth 8
+
+          $aiResponse = Invoke-RestMethod -Uri "https://models.github.ai/inference/chat/completions" -Method Post -Headers @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+          } -ContentType "application/json" -Body $payload
+          $aiNotes = "$($aiResponse.choices[0].message.content)".Trim()
+          if (-not $aiNotes) {
+            throw "The AI release-notes agent returned an empty response."
+          }
+          if ($aiNotes -notmatch '## Technical Release Notes for Developers' -or $aiNotes -notmatch '## Feature Release Notes for Customers') {
+            throw "The AI release-notes agent returned an unexpected format."
+          }
+
+          $aiNotesPath = Join-Path $env:GITHUB_WORKSPACE "ai-release-notes.md"
+          [System.IO.File]::WriteAllText($aiNotesPath, $aiNotes + [Environment]::NewLine)
+
+          $technicalMatch = [regex]::Match($aiNotes, '(?ms)^## Technical Release Notes for Developers\s*(.*?)(?=^## Feature Release Notes for Customers\s*)')
+          $featureMatch = [regex]::Match($aiNotes, '(?ms)^## Feature Release Notes for Customers\s*(.*)$')
+          if (-not $technicalMatch.Success -or -not $featureMatch.Success) {
+            throw "Unable to split the AI response into technical and feature release notes."
+          }
+          $technicalPath = Join-Path $env:GITHUB_WORKSPACE "technical-release-notes.md"
+          $featurePath = Join-Path $env:GITHUB_WORKSPACE "feature-release-notes.md"
+          $generatedAt = [DateTimeOffset]::UtcNow.ToString("yyyy-MM-dd HH:mm 'UTC'")
+          $technicalDocument = "# Technical Release Notes — $env:RELEASE_BRANCH`n`n> For developers and maintainers · Generated $generatedAt`n`n## Technical Release Notes for Developers`n`n$($technicalMatch.Groups[1].Value.Trim())`n"
+          $featureDocument = "# Feature Release Notes — $env:RELEASE_BRANCH`n`n> For customers and stakeholders · Generated $generatedAt`n`n## Feature Release Notes for Customers`n`n$($featureMatch.Groups[1].Value.Trim())`n"
+          [System.IO.File]::WriteAllText($technicalPath, $technicalDocument)
+          [System.IO.File]::WriteAllText($featurePath, $featureDocument)
 
       - name: Build release notes markdown
         env:
@@ -414,9 +505,22 @@ jobs:
           $now = [DateTimeOffset]::UtcNow.ToString("yyyy-MM-dd HH:mm 'UTC'")
 
           $lines = [System.Collections.Generic.List[string]]::new()
-          $lines.Add("# Release backport notes")
+          $branch = "${{ matrix.release.branch }}"
+          $status = "${{ matrix.release.status }}"
+          $lines.Add("# Release notes — $branch")
+          $lines.Add("")
+          $lines.Add("> **AI-assisted release notes**  ")
+          $lines.Add("> Generated from the selected merge-commit changes for **$branch**. Review before publishing.")
+          $lines.Add("")
+          $lines.Add("| Release branch | Backport status | Generated |")
+          $lines.Add("| --- | --- | --- |")
+          $lines.Add("| $branch | **$status** | $now |")
           $lines.Add("")
           $lines.Add("Generated: $now")
+          $lines.Add("")
+          $lines.Add((Get-Content -Raw -Path (Join-Path $env:GITHUB_WORKSPACE "technical-release-notes.md")).Trim())
+          $lines.Add("")
+          $lines.Add((Get-Content -Raw -Path (Join-Path $env:GITHUB_WORKSPACE "feature-release-notes.md")).Trim())
           $lines.Add("")
           $lines.Add("## Commits selected from main")
           $lines.Add("")
@@ -452,11 +556,18 @@ jobs:
           [System.IO.File]::WriteAllLines($notesPath, $lines)
           Get-Content -Path $notesPath | Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY
 
-      - name: Upload release notes artifact
+      - name: Upload technical release notes artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-backport-notes
-          path: release-notes.md
+          name: release-${{ matrix.release.artifactName }}-technical-release-notes
+          path: technical-release-notes.md
+          if-no-files-found: error
+
+      - name: Upload feature release notes artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.release.artifactName }}-feature-release-notes
+          path: feature-release-notes.md
           if-no-files-found: error
 
   FinalStatus:
