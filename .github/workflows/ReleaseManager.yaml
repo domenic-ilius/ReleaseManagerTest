@@ -148,20 +148,22 @@ jobs:
             $mergeCommits.Add($sha)
           }
 
-          $ordered = foreach ($sha in $mergeCommits) {
-            $subject = (& git show -s --format="%s" $sha).Trim()
-            if ($LASTEXITCODE -ne 0) {
-              throw "Unable to inspect subject for commit '$sha'."
+          $ordered = @(
+            foreach ($sha in $mergeCommits) {
+              $subject = (& git show -s --format="%s" $sha).Trim()
+              if ($LASTEXITCODE -ne 0) {
+                throw "Unable to inspect subject for commit '$sha'."
+              }
+              $prId = -1
+              if ($subject -match '#([0-9]+)\b') {
+                $prId = [int]$Matches[1]
+              }
+              [PSCustomObject]@{
+                sha = $sha
+                prId = $prId
+              }
             }
-            $prId = -1
-            if ($subject -match '#([0-9]+)\b') {
-              $prId = [int]$Matches[1]
-            }
-            [PSCustomObject]@{
-              sha = $sha
-              prId = $prId
-            }
-          } | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $true }
+          ) | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $true }
 
           $sortedMergeCommits = @($ordered.sha)
 
