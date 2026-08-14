@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       mergeCommits:
-        description: "Merge commit SHAs from main (space/comma/newline separated)"
+        description: "Commit SHAs from main (merge or non-merge; space/comma/newline separated)"
         required: true
         type: string
       releaseBranches:
@@ -102,7 +102,7 @@ jobs:
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "selectedBranches=$selected"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "### Target branches (processing order: lowest to highest)`n$($sorted -join "`n")`n"
 
-      - name: Parse and validate merge commits
+      - name: Parse and validate commits
         id: parseMergeCommits
         env:
           RAW_MERGE_COMMITS: ${{ inputs.mergeCommits }}
@@ -111,7 +111,7 @@ jobs:
 
           $tokens = ($env:RAW_MERGE_COMMITS -replace ',', ' ' -replace "`r", ' ' -replace "`n", ' ' -replace "`t", ' ').Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
           if ($tokens.Count -eq 0) {
-            throw "No merge commit SHAs were provided."
+            throw "No commit SHAs were provided."
           }
 
           $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -136,8 +136,8 @@ jobs:
             }
 
             $parts = $parentLine.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
-            if ($parts.Count -lt 3) {
-              throw "Commit '$sha' is not a merge commit."
+            if ($parts.Count -lt 2) {
+              throw "Commit '$sha' has no parent and cannot be cherry-picked."
             }
 
             & git merge-base --is-ancestor $sha origin/main
@@ -148,43 +148,39 @@ jobs:
             $mergeCommits.Add($sha)
           }
 
+          $selectedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($sha in $mergeCommits) {
+            $fullSha = (& git rev-parse $sha).Trim()
+            [void]$selectedSet.Add($fullSha)
+          }
           $ordered = @(
-            foreach ($sha in $mergeCommits) {
-              $subject = (& git show -s --format="%s" $sha).Trim()
-              if ($LASTEXITCODE -ne 0) {
-                throw "Unable to inspect subject for commit '$sha'."
-              }
-              $prId = -1
-              if ($subject -match '#([0-9]+)\b') {
-                $prId = [int]$Matches[1]
-              }
-              [PSCustomObject]@{
-                sha = $sha
-                prId = $prId
-                subject = $subject
+            foreach ($sha in (& git rev-list --reverse origin/main)) {
+              if ($selectedSet.Contains($sha.Trim())) {
+                $subject = (& git show -s --format="%s" $sha).Trim()
+                $parents = ((& git rev-list --parents -n 1 $sha).Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries).Count - 1)
+                [PSCustomObject]@{ sha = $sha.Trim(); type = $(if ($parents -gt 1) { "Merge" } else { "Direct" }); subject = $subject }
               }
             }
-          ) | Sort-Object -Stable -Property @{ Expression = "prId"; Descending = $false }
+          )
 
           $sortedMergeCommits = @($ordered.sha)
 
           $commitList = $sortedMergeCommits -join ","
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "mergeCommits=$commitList"
           $commitSummaryLines = @(
-            "### Merge commits (sorted by PR ID ascending)",
+            "### Commits (oldest to newest)",
             "",
-            "| PR | Merge commit | SHA |",
-            "| ---: | --- | --- |"
+            "| Type | Commit | SHA |",
+            "| --- | --- | --- |"
           )
           foreach ($commit in $ordered) {
             $safeSubject = "$($commit.subject)" -replace '\|', '\\|'
-            $prLabel = if ($commit.prId -ge 0) { "#$($commit.prId)" } else { "-" }
-            $commitSummaryLines += "| $prLabel | $safeSubject | $($commit.sha) |"
+            $commitSummaryLines += "| $($commit.type) | $safeSubject | $($commit.sha) |"
           }
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($commitSummaryLines -join "`n")
           Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ""
 
-      - name: Cherry-pick merge commits
+      - name: Cherry-pick commits
         id: backport
         env:
           SELECTED_BRANCHES: ${{ steps.selectBranches.outputs.selectedBranches }}
@@ -223,7 +219,12 @@ jobs:
             $previewBranch = ""
 
             foreach ($mergeCommit in $mergeCommits) {
-              $cherryPickOutput = & git cherry-pick -m 1 $mergeCommit 2>&1
+              $parentCount = ((& git rev-list --parents -n 1 $mergeCommit).Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries).Count - 1)
+              if ($parentCount -gt 1) {
+                $cherryPickOutput = & git cherry-pick -x -m 1 $mergeCommit 2>&1
+              } else {
+                $cherryPickOutput = & git cherry-pick -x $mergeCommit 2>&1
+              }
               if ($LASTEXITCODE -ne 0) {
                 $joinedOutput = $cherryPickOutput -join "`n"
                 if ($joinedOutput -match "previous cherry-pick is now empty" -or $joinedOutput -match "nothing to commit") {

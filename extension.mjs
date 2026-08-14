@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 const servers = new Map();
 const instanceState = new Map();
@@ -115,139 +114,18 @@ async function ensureReleaseManagerDir() {
     await mkdir(releaseManagerDir, { recursive: true });
 }
 
-function extractPrimaryPrId(text) {
-    const match = /#(\d+)\b/.exec(String(text ?? ""));
-    return match ? Number.parseInt(match[1], 10) : null;
-}
-
-async function findMainMergeShaForPrId(prId) {
-    const result = await runCommand("git", [
-        "log",
-        "origin/main",
-        "--merges",
-        "--grep",
-        `Merge pull request #${prId} `,
-        "--format=%H",
-        "-n",
-        "1",
-    ]);
-    if (result.code !== 0) {
-        return null;
-    }
-    const sha = result.stdout.trim();
-    return sha || null;
-}
-
-async function listRecentPrIdsOnBranch(branch, limit = 80) {
-    const result = await runCommand("git", [
-        "log",
-        `origin/${branch}`,
-        "--max-count",
-        String(limit),
-        "--format=%s",
-    ]);
-    if (result.code !== 0) {
-        return [];
-    }
-
-    const ids = [];
-    const seen = new Set();
-    for (const line of result.stdout.split(/\r?\n/)) {
-        const prId = extractPrimaryPrId(line);
-        if (Number.isInteger(prId) && !seen.has(prId)) {
-            seen.add(prId);
-            ids.push(prId);
-        }
-    }
-    return ids;
-}
-
-function getPreferredBackfillBranches(allBranches) {
-    const preferred = ["release/28.0", "release/27.1", "release/26.4", "release/25.9"];
-    const selected = preferred.filter((branch) => allBranches.includes(branch));
-    if (selected.length >= 2) {
-        return selected;
-    }
-    return allBranches.slice(0, Math.min(4, allBranches.length));
-}
-
-async function trySeedRunHistory(entries) {
-    if (entries.length > 0) {
-        return entries;
-    }
-
-    const allBranches = await listReleaseBranches();
-    const targetBranches = getPreferredBackfillBranches(allBranches);
-    if (targetBranches.length < 2) {
-        return entries;
-    }
-
-    const prLists = await Promise.all(targetBranches.map((branch) => listRecentPrIdsOnBranch(branch)));
-    const commonPrIds = prLists
-        .reduce((acc, list) => {
-            const set = new Set(list);
-            return acc.filter((id) => set.has(id));
-        }, [...prLists[0]])
-        .sort((a, b) => b - a);
-
-    const chosenPrIds = commonPrIds.slice(0, 8);
-    const mergeCommits = [];
-    for (const prId of chosenPrIds) {
-        const sha = await findMainMergeShaForPrId(prId);
-        if (sha) {
-            mergeCommits.push(sha);
-        }
-    }
-
-    if (mergeCommits.length === 0) {
-        return entries;
-    }
-
-    const createdAt = new Date().toISOString();
-    const imported = {
-        id: `imported-${Date.now()}`,
-        createdAt,
-        mode: "imported",
-        run: {
-            databaseId: `imported-${Date.now()}`,
-            status: "completed",
-            conclusion: "success",
-            url: "",
-        },
-        runInput: {
-            mergeCommits,
-            branches: targetBranches,
-            pushChanges: true,
-            generateReleaseNotes: true,
-        },
-        details: targetBranches.map((branch) => ({
-            branch,
-            status: "success",
-            applied: [...mergeCommits],
-            skipped: [],
-            pushed: true,
-            failure: "",
-        })),
-        releaseNotesPath: "",
-    };
-
-    const next = [imported, ...entries];
-    await saveRunHistory(next);
-    return next;
-}
-
 async function loadRunHistory() {
     await ensureReleaseManagerDir();
     try {
         const raw = await readFile(runHistoryPath, "utf8");
         const parsed = JSON.parse(raw);
         if (!Array.isArray(parsed)) {
-            return trySeedRunHistory([]);
+          return [];
         }
-        return trySeedRunHistory(parsed);
+        return parsed;
     } catch (error) {
         if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-            return trySeedRunHistory([]);
+          return [];
         }
         throw error;
     }
@@ -284,6 +162,7 @@ async function recordRunHistory(run, runInput) {
         },
         details: Array.isArray(run.details) ? run.details : undefined,
         releaseNotesPath: run.releaseNotesPath ?? "",
+        releaseNotesError: run.releaseNotesError ?? "",
     });
     await saveRunHistory(next.slice(0, 100));
 }
@@ -329,49 +208,68 @@ async function listReleaseBranches() {
         .sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" }));
 }
 
-async function listMainMergeCommits(limit = 40) {
+async function listMainCommits(limit = 100) {
     await runCommand("git", ["fetch", "--no-tags", "origin", "main"]);
     const logResult = await runCommand("git", [
         "log",
         "origin/main",
-        "--merges",
         "--date=short",
         `-n${limit}`,
-        "--pretty=format:%H%x1f%ad%x1f%s",
+    "--pretty=format:%H%x1f%ad%x1f%s%x1f%P",
     ]);
     if (logResult.code !== 0) {
-        throw new Error(`Unable to list merge commits from main:\n${logResult.stderr || logResult.stdout}`.trim());
+    throw new Error(`Unable to list commits from main:\n${logResult.stderr || logResult.stdout}`.trim());
     }
     return logResult.stdout
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter(Boolean)
         .map((line) => {
-            const [sha, date, subject] = line.split("\u001f");
-            return { sha, date, subject };
-        });
+            const [sha, date, subject, parents = ""] = line.split("\u001f");
+            const parentCount = parents.trim() ? parents.trim().split(/\s+/).length : 0;
+            return { sha, date, subject, parentCount, isMerge: parentCount > 1 };
+        })
+        .filter((commit) => commit.parentCount > 0);
 }
 
 function normalizeRunInput(input) {
-    const selectedCommits = Array.isArray(input?.selectedMergeCommits)
-        ? input.selectedMergeCommits.map((sha) => String(sha).trim()).filter(Boolean)
+    const selectedCommits = Array.isArray(input?.selectedCommits ?? input?.selectedMergeCommits)
+      ? (input.selectedCommits ?? input.selectedMergeCommits).map((sha) => String(sha).trim()).filter(Boolean)
         : [];
-    const manualCommits = tokenizeList(typeof input?.extraMergeCommits === "string" ? input.extraMergeCommits : "");
-    const mergeCommits = [...new Set([...selectedCommits, ...manualCommits])];
+    const manualCommits = tokenizeList(typeof (input?.extraCommits ?? input?.extraMergeCommits) === "string" ? (input.extraCommits ?? input.extraMergeCommits) : "");
+    const mergeCommits = [];
+    const seenCommits = new Set();
+    for (const commit of [...selectedCommits, ...manualCommits]) {
+      const key = commit.toLowerCase();
+      if (!seenCommits.has(key)) {
+        seenCommits.add(key);
+        mergeCommits.push(commit);
+      }
+    }
     if (mergeCommits.length === 0) {
-        throw new Error("Select at least one merge commit from main or add one manually.");
+        throw new Error("Select at least one commit from main or add one manually.");
     }
 
-    const branches = Array.isArray(input?.branches)
-        ? input.branches.map((branch) => String(branch).trim()).filter((branch) => branch.startsWith("release/"))
-        : [];
+    const branches = [];
+    const seenBranches = new Set();
+    for (const value of Array.isArray(input?.branches) ? input.branches : []) {
+      const branch = String(value).trim();
+      if (!/^release\/[0-9]+(?:\.[0-9]+)*$/i.test(branch)) {
+        throw new Error(`Invalid branch '${branch}'. Expected release/<numeric-version>.`);
+      }
+      const key = branch.toLowerCase();
+      if (!seenBranches.has(key)) {
+        seenBranches.add(key);
+        branches.push(branch);
+      }
+    }
     if (branches.length === 0) {
         throw new Error("Select at least one target release branch.");
     }
 
     return {
         mergeCommits,
-        branches: [...new Set(branches)],
+        branches,
         pushChanges: normalizeBoolean(input?.pushChanges, true),
         generateReleaseNotes: normalizeBoolean(input?.generateReleaseNotes, true),
         executionMode: input?.executionMode === "online" ? "online" : "local",
@@ -431,8 +329,8 @@ async function validateLocalBackportInput(runInput) {
       throw new Error(`Commit '${sha}' does not exist in this repository.`);
     }
     const parents = await runCommand("git", ["rev-list", "--parents", "-n", "1", sha]);
-    if (parents.code !== 0 || parents.stdout.trim().split(/\s+/).length < 3) {
-      throw new Error(`Commit '${sha}' is not a merge commit.`);
+    if (parents.code !== 0 || parents.stdout.trim().split(/\s+/).length < 2) {
+      throw new Error(`Commit '${sha}' has no parent and cannot be cherry-picked.`);
     }
     const reachable = await runCommand("git", ["merge-base", "--is-ancestor", sha, "origin/main"]);
     if (reachable.code !== 0) {
@@ -441,36 +339,50 @@ async function validateLocalBackportInput(runInput) {
   }
 }
 
-function getPrimaryPrIdFromSubject(subject) {
-    const values = extractPrNumbers(subject).map((value) => Number.parseInt(value, 10)).filter(Number.isFinite);
-    return values.length > 0 ? values[0] : null;
+async function sortCommitsOldestFirst(commits) {
+  const selected = new Map(commits.map((sha) => [normalizeSha(sha), sha]));
+  const result = await runCommand("git", ["rev-list", "--reverse", "origin/main"]);
+  if (result.code !== 0) {
+    throw new Error(`Unable to order selected commits:\n${result.stderr || result.stdout}`.trim());
+  }
+  const ordered = result.stdout.split(/\r?\n/).map((sha) => sha.trim()).filter((sha) => selected.has(normalizeSha(sha)));
+  const orderedSet = new Set(ordered.map(normalizeSha));
+  return [...ordered, ...commits.filter((sha) => !orderedSet.has(normalizeSha(sha)))];
 }
 
-async function sortMergeCommitsByPrDescending(mergeCommits) {
-    const subjects = await getCommitSubjectsMap(mergeCommits);
-    const decorated = mergeCommits.map((sha, index) => {
-        const subject = subjects.get(sha) ?? "";
-        return {
-            sha,
-            index,
-            prId: getPrimaryPrIdFromSubject(subject),
-        };
-    });
+async function prepareRunInput(runInput) {
+  const fetchAll = await runCommand("git", ["fetch", "--no-tags", "origin"]);
+  if (fetchAll.code !== 0) {
+    throw new Error(`Unable to fetch origin:\n${fetchAll.stderr || fetchAll.stdout}`.trim());
+  }
 
-    decorated.sort((left, right) => {
-        if (left.prId !== null && right.prId !== null && left.prId !== right.prId) {
-            return right.prId - left.prId;
-        }
-        if (left.prId !== null && right.prId === null) {
-            return -1;
-        }
-        if (left.prId === null && right.prId !== null) {
-            return 1;
-        }
-        return left.index - right.index;
-    });
+  const canonicalCommits = [];
+  const seen = new Set();
+  for (const revision of runInput.mergeCommits) {
+    const resolved = await runCommand("git", ["rev-parse", "--verify", `${revision}^{commit}`]);
+    if (resolved.code !== 0) {
+      throw new Error(`Commit '${revision}' does not exist in this repository.`);
+    }
+    const sha = resolved.stdout.trim().toLowerCase();
+    const reachable = await runCommand("git", ["merge-base", "--is-ancestor", sha, "origin/main"]);
+    if (reachable.code !== 0) {
+      throw new Error(`Commit '${revision}' is not reachable from origin/main.`);
+    }
+    const parents = await runCommand("git", ["rev-list", "--parents", "-n", "1", sha]);
+    if (parents.code !== 0 || parents.stdout.trim().split(/\s+/).length < 2) {
+      throw new Error(`Commit '${revision}' has no parent and cannot be cherry-picked.`);
+    }
+    if (!seen.has(sha)) {
+      seen.add(sha);
+      canonicalCommits.push(sha);
+    }
+  }
 
-    return decorated.map((entry) => entry.sha);
+  return {
+    ...runInput,
+    branches: sortReleaseBranchesAscending(runInput.branches),
+    mergeCommits: await sortCommitsOldestFirst(canonicalCommits),
+  };
 }
 
 function isWorkflowNotFoundError(error) {
@@ -542,11 +454,9 @@ async function buildPastRunsForUi(recentRuns) {
 }
 
 async function triggerReleaseWorkflow(runInput) {
-    const sortedMergeCommits = await sortMergeCommitsByPrDescending(runInput.mergeCommits);
-    const orderedInput = {
-        ...runInput,
-        mergeCommits: sortedMergeCommits,
-    };
+  const orderedInput = await prepareRunInput(runInput);
+  runInput.branches = orderedInput.branches;
+  runInput.mergeCommits = orderedInput.mergeCommits;
     if (orderedInput.executionMode === "online") {
       return runOnlineWorkflow(orderedInput);
     }
@@ -576,6 +486,45 @@ function isEmptyCherryPick(text) {
         || value.includes("the previous cherry-pick is now empty");
 }
 
+let localOperationActive = false;
+
+async function withLocalOperation(operation) {
+  if (localOperationActive) {
+    throw new Error("Another local release operation is already running. Wait for it to finish before starting another one.");
+  }
+  localOperationActive = true;
+  try {
+    return await operation();
+  } finally {
+    localOperationActive = false;
+  }
+}
+
+async function deleteRemotePreviewBranch(previewBranch) {
+  if (!previewBranch) {
+    return;
+  }
+  const result = await runCommand("git", ["push", "origin", "--delete", previewBranch]);
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (result.code !== 0 && !/remote ref does not exist|reference does not exist|unable to delete/i.test(output)) {
+    throw new Error(`Unable to delete preview branch '${previewBranch}':\n${output}`.trim());
+  }
+}
+
+async function cleanupPreviewBranches(previewBranches) {
+  const failures = [];
+  for (const previewBranch of previewBranches) {
+    try {
+      await deleteRemotePreviewBranch(previewBranch);
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(failures.join("\n\n"));
+  }
+}
+
 async function runLocalBackportUnsafe(runInput) {
     const mergeCommits = runInput.mergeCommits;
     const branches = sortReleaseBranchesAscending(runInput.branches);
@@ -583,13 +532,10 @@ async function runLocalBackportUnsafe(runInput) {
     const results = [];
     let hadFailures = false;
     const localId = `local-${Date.now()}`;
+    const createdPreviews = [];
 
-    const fetchAll = await runCommand("git", ["fetch", "--no-tags", "origin"]);
-    if (fetchAll.code !== 0) {
-      throw new Error(`Unable to fetch origin:\n${fetchAll.stderr || fetchAll.stdout}`.trim());
-    }
-
-    for (const branch of branches) {
+    try {
+      for (const branch of branches) {
         const fetchBranch = await runCommand("git", ["fetch", "--no-tags", "origin", branch]);
         if (fetchBranch.code !== 0) {
             throw new Error(`Unable to fetch branch '${branch}':\n${fetchBranch.stderr || fetchBranch.stdout}`.trim());
@@ -609,7 +555,12 @@ async function runLocalBackportUnsafe(runInput) {
         let readyForPush = false;
         let pushed = false;
         for (const mergeCommit of mergeCommits) {
-            const pick = await runCommand("git", ["cherry-pick", "-m", "1", mergeCommit]);
+          const parents = await runCommand("git", ["rev-list", "--parents", "-n", "1", mergeCommit]);
+          const isMerge = parents.stdout.trim().split(/\s+/).length > 2;
+          const pickArgs = isMerge
+            ? ["cherry-pick", "-x", "-m", "1", mergeCommit]
+            : ["cherry-pick", "-x", mergeCommit];
+          const pick = await runCommand("git", pickArgs);
             if (pick.code !== 0) {
                 const output = `${pick.stdout}\n${pick.stderr}`.trim();
                 if (isEmptyCherryPick(output)) {
@@ -621,7 +572,10 @@ async function runLocalBackportUnsafe(runInput) {
                     continue;
                 }
 
-                await runCommand("git", ["cherry-pick", "--abort"]);
+                const abort = await runCommand("git", ["cherry-pick", "--abort"]);
+                if (abort.code !== 0) {
+                  throw new Error(`Cherry-pick failed for '${mergeCommit}' on '${branch}' and abort also failed:\n${abort.stderr || abort.stdout}`.trim());
+                }
                 status = "failed";
                 failure = `Conflict while cherry-picking ${mergeCommit} on ${branch}.\n${output}`;
                 hadFailures = true;
@@ -639,6 +593,7 @@ async function runLocalBackportUnsafe(runInput) {
                 hadFailures = true;
             } else {
                 readyForPush = true;
+              createdPreviews.push(previewBranch);
             }
         }
 
@@ -652,17 +607,26 @@ async function runLocalBackportUnsafe(runInput) {
             readyForPush,
             failure,
         });
-    }
+          }
+
+          if (hadFailures && createdPreviews.length > 0) {
+            await cleanupPreviewBranches(createdPreviews);
+            for (const detail of results) {
+              detail.readyForPush = false;
+            }
+          }
 
     let releaseNotesPath = "";
+    let releaseNotesError = "";
     if (runInput.generateReleaseNotes) {
+      try {
         const subjects = await getCommitSubjectsMap(mergeCommits);
         const lines = [];
         lines.push("# Local release backport notes");
         lines.push("");
         lines.push(`Generated: ${new Date().toISOString()}`);
         lines.push("");
-        lines.push("## Merge commits (processed order)");
+        lines.push("## Commits (processed oldest to newest)");
         lines.push("");
         for (const commit of mergeCommits) {
             lines.push(`- \`${commit}\` ${subjects.get(commit) ?? ""}`);
@@ -693,20 +657,40 @@ async function runLocalBackportUnsafe(runInput) {
         const fileName = `release-notes-local-${Date.now()}.md`;
         releaseNotesPath = join(releaseManagerDir, fileName);
         await writeFile(releaseNotesPath, `${lines.join("\n")}\n`, "utf8");
+      } catch (error) {
+        releaseNotesError = error instanceof Error ? error.message : String(error);
+      }
     }
 
-    return {
+      return {
         databaseId: localId,
-        status: "completed",
-        conclusion: hadFailures ? "failure" : "success",
+        status: !hadFailures && results.some((detail) => detail.readyForPush) ? "waiting_for_approval" : "completed",
+        conclusion: hadFailures ? "failure" : (results.some((detail) => detail.readyForPush) ? "" : "success"),
         url: "",
         mode: "local",
         releaseNotesPath,
+        releaseNotesError,
         details: results,
-    };
+      };
+    } catch (error) {
+      if (createdPreviews.length > 0) {
+        try {
+          await cleanupPreviewBranches(createdPreviews);
+        } catch (cleanupError) {
+          const original = error instanceof Error ? error.message : String(error);
+          const cleanup = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          throw new Error(`${original}\n\nPreview cleanup also failed:\n${cleanup}`);
+        }
+      }
+      throw error;
+    }
 }
 
   async function runLocalBackport(runInput) {
+    return withLocalOperation(() => runLocalBackportExclusive(runInput));
+  }
+
+  async function runLocalBackportExclusive(runInput) {
     const statusResult = await runCommand("git", ["status", "--porcelain"]);
     if (statusResult.code !== 0) {
       throw new Error(`Unable to inspect the local Git worktree:\n${statusResult.stderr || statusResult.stdout}`.trim());
@@ -735,10 +719,19 @@ async function runLocalBackportUnsafe(runInput) {
         // Do not hide the original run error, but make restoration failure visible.
         console.error(`Release manager could not restore Git checkout: ${restored.stderr || restored.stdout}`);
       }
+      await runCommand("git", ["branch", "--list", "release-manager-local/*", "--format=%(refname:short)"]).then(async (listed) => {
+        for (const branch of listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+          await runCommand("git", ["branch", "-D", branch]);
+        }
+      });
     }
   }
 
 async function approvePushForRun(runId) {
+  return withLocalOperation(() => approvePushForRunExclusive(runId));
+}
+
+async function approvePushForRunExclusive(runId) {
     const id = String(runId ?? "").trim();
     if (!id) {
         throw new Error("runId is required.");
@@ -773,6 +766,7 @@ async function approvePushForRun(runId) {
     const restoreRef = branchResult.code === 0 && branchResult.stdout.trim()
       ? branchResult.stdout.trim()
       : headResult.stdout.trim();
+    const pushedBranches = [];
     try {
       for (const detail of toPush) {
         const fetchPreview = await runCommand("git", ["fetch", "--no-tags", "origin", detail.previewBranch]);
@@ -794,12 +788,38 @@ async function approvePushForRun(runId) {
         detail.pushed = true;
         detail.readyForPush = false;
         detail.approvedPushAt = new Date().toISOString();
+        pushedBranches.push(detail.branch);
+
+        await deleteRemotePreviewBranch(detail.previewBranch);
+        detail.previewDeleted = true;
+        history[index] = { ...entry, details: entry.details };
+        await saveRunHistory(history);
       }
+    } catch (error) {
+      for (const detail of toPush.filter((candidate) => candidate.readyForPush && candidate.previewBranch)) {
+        try {
+          await deleteRemotePreviewBranch(detail.previewBranch);
+          detail.readyForPush = false;
+          detail.previewDeleted = true;
+        } catch {
+          // Preserve the primary push failure; cleanup state remains visible in history.
+        }
+      }
+      history[index] = {
+        ...entry,
+        run: { ...(entry.run ?? {}), status: "completed", conclusion: "failure" },
+        details: entry.details,
+      };
+      await saveRunHistory(history);
+      throw error;
     } finally {
       const restoreArgs = branchResult.code === 0 && branchResult.stdout.trim()
         ? ["checkout", restoreRef]
         : ["checkout", "--detach", restoreRef];
-      await runCommand("git", restoreArgs);
+      const restored = await runCommand("git", restoreArgs);
+      if (restored.code !== 0) {
+        console.error(`Release manager could not restore Git checkout: ${restored.stderr || restored.stdout}`);
+      }
     }
 
     history[index] = {
@@ -812,7 +832,7 @@ async function approvePushForRun(runId) {
         details: entry.details,
     };
     await saveRunHistory(history);
-    return { pushedBranches: toPush.map((detail) => detail.branch) };
+    return { pushedBranches };
 }
 
 async function generateReleaseNotesFromPastRun(runId) {
@@ -896,7 +916,7 @@ async function getUiData() {
     }
     const [releaseBranches, mergeCommits, recentRuns] = await Promise.all([
         listReleaseBranches(),
-        listMainMergeCommits(40),
+        listMainCommits(100),
         listRecentRuns(5),
     ]);
     const pastRuns = await buildPastRunsForUi(recentRuns);
@@ -979,12 +999,24 @@ async function getBranchPrNumbers(branch) {
 
 async function getCommitPrNumbers(mergeCommits) {
     const map = new Map();
-    for (const commit of mergeCommits) {
-        const result = await runCommand("git", ["show", "-s", "--format=%s", commit]);
-        if (result.code !== 0) {
-            throw new Error(`Unable to inspect commit ${commit}:\n${result.stderr || result.stdout}`.trim());
-        }
-        map.set(commit, extractPrNumbers(result.stdout));
+  if (mergeCommits.length === 0) {
+    return map;
+  }
+  const result = await runCommand("git", ["show", "-s", "--format=%H%x1f%s%x1f%P%x1e", ...mergeCommits]);
+  if (result.code !== 0) {
+    throw new Error(`Unable to inspect selected commits:\n${result.stderr || result.stdout}`.trim());
+  }
+  const metadata = new Map();
+  for (const record of result.stdout.split("\u001e")) {
+    const [sha = "", subject = "", parents = ""] = record.trim().split("\u001f");
+    if (sha) {
+      metadata.set(normalizeSha(sha), { subject, parents });
+    }
+  }
+  for (const commit of mergeCommits) {
+    const entry = [...metadata.entries()].find(([sha]) => shaMatches(commit, sha))?.[1];
+    const isMerge = entry?.parents.trim().split(/\s+/).filter(Boolean).length > 1;
+    map.set(commit, isMerge ? extractPrNumbers(entry?.subject ?? "") : []);
     }
     return map;
 }
@@ -1069,25 +1101,29 @@ function renderHtml(instanceId) {
       * { box-sizing: border-box; }
       body {
         margin: 0;
-        padding: 18px;
-        background: var(--background-color-default, #ffffff);
+        padding: 28px 20px 48px;
+        background:
+          radial-gradient(circle at 12% 0%, rgba(88, 166, 255, .16), transparent 32rem),
+          radial-gradient(circle at 90% 8%, rgba(163, 113, 247, .13), transparent 28rem),
+          var(--background-color-default, #f6f8fa);
         color: var(--text-color-default, #1f2328);
         font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
         font-size: var(--text-body-medium, 14px);
       }
       .shell {
-        max-width: 1100px;
+        max-width: 1240px;
         margin: 0 auto;
       }
       .hero {
-        border: 1px solid var(--border-color-default, #d1d9e0);
-        border-radius: 14px;
-        padding: 18px;
+        border: 1px solid color-mix(in srgb, var(--true-color-blue, #0969da) 24%, var(--border-color-default, #d1d9e0));
+        border-radius: 24px;
+        padding: 26px 28px;
         background:
           linear-gradient(180deg, color-mix(in srgb, var(--background-color-default, #ffffff) 88%, var(--true-color-blue-muted, #ddf4ff) 12%) 0%, var(--background-color-default, #ffffff) 100%);
-        margin-bottom: 14px;
+        margin-bottom: 18px;
+        box-shadow: 0 18px 55px rgba(31, 35, 40, .08);
       }
-      h1 { margin: 0 0 6px; font-size: 24px; letter-spacing: -0.01em; }
+      h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.035em; }
       h2 { margin: 0 0 10px; font-size: 16px; }
       .muted { color: var(--text-color-muted, #656d76); }
       .row { margin-bottom: 14px; }
@@ -1098,10 +1134,10 @@ function renderHtml(instanceId) {
       }
       .panel {
         border: 1px solid var(--border-color-default, #d1d9e0);
-        border-radius: 12px;
-        padding: 12px;
+        border-radius: 18px;
+        padding: 18px;
         background: var(--background-color-default, #ffffff);
-        box-shadow: 0 1px 0 color-mix(in srgb, var(--border-color-default, #d1d9e0) 50%, transparent);
+        box-shadow: 0 10px 30px rgba(31, 35, 40, .06);
       }
       .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
       .badge {
@@ -1112,7 +1148,7 @@ function renderHtml(instanceId) {
         color: var(--text-color-muted, #656d76);
       }
       .list {
-        max-height: 260px;
+        max-height: 430px;
         overflow: auto;
         border: 1px solid var(--border-color-default, #d1d9e0);
         border-radius: 10px;
@@ -1180,6 +1216,12 @@ function renderHtml(instanceId) {
         border: 1px solid var(--border-color-default, #d1d9e0);
         border-radius: 10px;
         padding: 9px 10px;
+        cursor: pointer;
+        transition: transform .15s ease, border-color .15s ease, background .15s ease;
+      }
+      .commit-card:hover:not(.covered) {
+        transform: translateY(-1px);
+        border-color: color-mix(in srgb, var(--true-color-blue, #0969da) 45%, var(--border-color-default, #d1d9e0));
       }
       .commit-card.selected {
         border-color: color-mix(in srgb, var(--true-color-blue, #0969da) 45%, var(--border-color-default, #d1d9e0) 55%);
@@ -1202,6 +1244,28 @@ function renderHtml(instanceId) {
         font-size: 11px;
         color: var(--text-color-muted, #656d76);
       }
+      .commit-type {
+        display: inline-flex;
+        margin-right: 7px;
+        border-radius: 999px;
+        padding: 2px 7px;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        color: #fff;
+        background: #8250df;
+      }
+      .commit-type.direct { background: #1a7f37; }
+      .commit-tools { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+      .search-input {
+        min-width: 220px; flex: 1; padding: 9px 12px; color: inherit;
+        background: var(--background-color-default, #fff);
+        border: 1px solid var(--border-color-default, #d1d9e0); border-radius: 10px;
+      }
+      .filter-group { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--border-color-default, #d1d9e0); border-radius: 11px; }
+      .filter-btn { padding: 5px 10px; border: 0; background: transparent; }
+      .filter-btn.active { color: #fff; background: var(--true-color-blue, #0969da); }
       .checks {
         display: flex;
         gap: 10px;
@@ -1222,10 +1286,15 @@ function renderHtml(instanceId) {
       button:hover {
         background: color-mix(in srgb, var(--background-color-default, #ffffff) 74%, var(--border-color-default, #d1d9e0) 26%);
       }
+      button:focus-visible, textarea:focus-visible, input:focus-visible {
+        outline: 3px solid color-mix(in srgb, var(--true-color-blue, #0969da) 35%, transparent);
+        outline-offset: 2px;
+      }
       button:disabled {
         opacity: 0.65;
         cursor: default;
       }
+      .primary:disabled { transform: none; box-shadow: none; filter: grayscale(.25); }
       .actions { display: flex; gap: 8px; flex-wrap: wrap; }
       .primary {
         background: color-mix(in srgb, var(--true-color-blue, #0969da) 22%, var(--background-color-default, #ffffff) 78%);
@@ -1285,7 +1354,11 @@ function renderHtml(instanceId) {
         position: sticky;
         bottom: 0;
         background: var(--background-color-default, #ffffff);
-        padding-top: 10px;
+        margin-top: 14px;
+        padding: 12px;
+        border: 1px solid var(--border-color-default, #d1d9e0);
+        border-radius: 14px;
+        box-shadow: 0 -8px 28px rgba(31, 35, 40, .08);
       }
       #status {
         min-height: 20px;
@@ -1313,31 +1386,132 @@ function renderHtml(instanceId) {
         border-radius: 6px;
         padding: 1px 5px;
       }
+      :root {
+        color-scheme: light dark;
+        --accent: #6d5dfc;
+        --accent-2: #2488ff;
+        --success: #20a464;
+        --surface: color-mix(in srgb, var(--background-color-default, #fff) 91%, transparent);
+        --surface-soft: color-mix(in srgb, var(--background-color-default, #fff) 82%, var(--accent) 3%);
+        --hairline: color-mix(in srgb, var(--border-color-default, #d1d9e0) 72%, transparent);
+      }
+      body { min-height: 100vh; background-attachment: fixed; }
+      .app-header {
+        display: flex; align-items: center; justify-content: space-between; gap: 18px;
+        margin-bottom: 18px; padding: 0 4px;
+      }
+      .brand { display: flex; align-items: center; gap: 12px; }
+      .brand-mark {
+        width: 42px; height: 42px; display: grid; place-items: center; border-radius: 13px;
+        color: #fff; font-size: 21px; font-weight: 900;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        box-shadow: 0 10px 24px rgba(79, 70, 229, .25), inset 0 1px rgba(255,255,255,.25);
+      }
+      .brand-name { font-size: 15px; font-weight: 800; letter-spacing: -.01em; }
+      .brand-sub { margin-top: 1px; font-size: 11px; color: var(--text-color-muted, #656d76); }
+      .connection-pill {
+        display: inline-flex; align-items: center; gap: 8px; max-width: 480px;
+        padding: 7px 11px; border: 1px solid var(--hairline); border-radius: 999px;
+        background: var(--surface); backdrop-filter: blur(16px); font-size: 12px;
+      }
+      .connection-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px rgba(32,164,100,.12); }
+      .connection-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hero { position: relative; overflow: hidden; padding: 36px 38px; }
+      .hero::after {
+        content: ""; position: absolute; right: -90px; top: -130px; width: 340px; height: 340px;
+        border-radius: 50%; background: linear-gradient(135deg, rgba(109,93,252,.18), rgba(36,136,255,.06)); filter: blur(2px);
+      }
+      .hero-grid { position: relative; z-index: 1; display: grid; grid-template-columns: 1fr auto; gap: 28px; align-items: end; }
+      .eyebrow { margin-bottom: 10px; color: var(--accent); font-size: 11px; font-weight: 850; letter-spacing: .13em; text-transform: uppercase; }
+      .hero h1 { max-width: 700px; font-size: clamp(30px, 5vw, 46px); line-height: 1.04; }
+      .hero-copy { max-width: 680px; font-size: 15px; line-height: 1.6; }
+      .hero-action { align-self: center; white-space: nowrap; }
+      .layout { grid-template-columns: minmax(270px, .8fr) minmax(480px, 1.7fr); gap: 16px; align-items: start; }
+      .panel { border-color: var(--hairline); background: var(--surface); backdrop-filter: blur(18px); }
+      .branch-panel { position: sticky; top: 16px; }
+      .step-heading { display: flex; align-items: center; gap: 10px; }
+      .step-number {
+        width: 28px; height: 28px; display: inline-grid; place-items: center; border-radius: 9px;
+        color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-size: 12px; font-weight: 850;
+      }
+      .section-kicker { margin: -4px 0 16px 38px; color: var(--text-color-muted, #656d76); font-size: 12px; }
+      .chip-wrap { gap: 7px; }
+      .chip { width: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 11px; text-align: left; }
+      .chip::after { content: ""; width: 7px; height: 7px; border: 2px solid var(--border-color-default, #d1d9e0); border-radius: 50%; }
+      .chip.selected::after { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+      .commit-tools { padding: 8px; background: var(--surface-soft); border: 1px solid var(--hairline); border-radius: 14px; }
+      .list { border: 0; padding: 4px; background: transparent; }
+      .commit-card { margin: 5px 0; padding: 12px 13px; border-color: var(--hairline); background: var(--surface-soft); }
+      .commit-card.selected { box-shadow: inset 3px 0 var(--accent); }
+      .commit-cover-badge { flex: none; background: var(--surface); }
+      .checks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 0; border: 0; }
+      .switch {
+        position: relative; min-height: 66px; display: flex; align-items: center; padding: 13px 48px 13px 15px;
+        border-color: var(--hairline); border-radius: 15px; background: var(--surface); backdrop-filter: blur(18px);
+        font-size: 12px; font-weight: 700; box-shadow: 0 8px 24px rgba(31,35,40,.04);
+      }
+      .switch::after {
+        content: ""; position: absolute; right: 14px; width: 28px; height: 16px; border-radius: 999px;
+        background: var(--border-color-default, #d1d9e0); box-shadow: inset 0 0 0 1px rgba(0,0,0,.08);
+      }
+      .switch::before {
+        content: ""; position: absolute; z-index: 1; right: 27px; width: 12px; height: 12px; border-radius: 50%;
+        background: #fff; transition: transform .18s ease;
+      }
+      .switch.on::after { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+      .switch.on::before { transform: translateX(12px); }
+      .footer-actions { display: flex; align-items: center; justify-content: space-between; gap: 18px; background: var(--surface); backdrop-filter: blur(22px); }
+      .selection-summary { display: flex; align-items: center; gap: 10px; min-width: 0; }
+      .summary-icon { width: 32px; height: 32px; display: grid; place-items: center; flex: none; border-radius: 10px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+      .summary-title { font-weight: 750; }
+      .summary-sub { font-size: 11px; color: var(--text-color-muted, #656d76); }
+      .primary { color: #fff; border: 0; padding: 11px 17px; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 8px 20px rgba(79,70,229,.22); }
+      .primary:hover { background: linear-gradient(135deg, #5b4bea, #1478e8); transform: translateY(-1px); }
+      .loading-shell { padding: 18px; border: 1px solid var(--hairline); border-radius: 16px; background: var(--surface); }
       @media (max-width: 900px) {
         .layout { grid-template-columns: 1fr; }
+        .branch-panel { position: static; }
+        .checks { grid-template-columns: 1fr; }
+        .hero-grid { grid-template-columns: 1fr; }
+        .hero-action { justify-self: start; }
+        .app-header { align-items: flex-start; flex-direction: column; }
+        .connection-pill { max-width: 100%; }
+        .footer-actions { align-items: stretch; flex-direction: column; }
       }
     </style>
   </head>
   <body>
     <div class="shell">
+      <header class="app-header">
+        <div class="brand">
+          <div class="brand-mark">R</div>
+          <div><div class="brand-name">Release Manager</div><div class="brand-sub">Backport orchestration workspace</div></div>
+        </div>
+        ${_repoRoot ? `<div class="connection-pill"><span class="connection-dot"></span><span>Connected</span><span class="connection-path muted">${escapeHtml(_repoRoot)}</span></div>` : ""}
+      </header>
       <div class="hero">
-        <h1>Release manager</h1>
-        <div class="muted">Select branches and merge commits from <code>main</code>, then run <code>ReleaseManager.yaml</code>.</div>
-        <div class="actions" style="margin-top:12px;">
-          <button id="changeRepoBtn" type="button">Change repository</button>
-          ${_repoRoot ? `<span class="muted small">Connected to <code>${escapeHtml(_repoRoot)}</code></span>` : ""}
+        <div class="hero-grid">
+          <div>
+            <div class="eyebrow">Release orchestration</div>
+            <h1>Ship changes across release branches with confidence.</h1>
+            <div class="hero-copy muted">Select merge or direct commits from <code>main</code>, preview branch coverage, and backport everything through one guided workflow.</div>
+          </div>
+          <div class="hero-action">
+            <button id="changeRepoBtn" type="button">⚙ Change repository</button>
+          </div>
         </div>
       </div>
 
-      <div id="loading" class="row">Loading branches and merge commits…</div>
+      <div id="loading" class="row loading-shell">Loading your release workspace…</div>
 
       <div id="app" style="display:none;">
         <div class="layout">
-          <div class="panel">
+          <div class="panel branch-panel">
             <div class="panel-head">
-              <h2>1. Target release branches</h2>
+              <h2 class="step-heading"><span class="step-number">1</span> Target branches</h2>
               <div id="branchCount" class="badge">0 selected</div>
             </div>
+            <div class="section-kicker">Choose where changes should land</div>
             <div class="actions row">
               <button id="selectAllBranchesBtn" type="button">Select all</button>
               <button id="clearBranchesBtn" type="button">Clear</button>
@@ -1347,18 +1521,27 @@ function renderHtml(instanceId) {
 
           <div class="panel">
             <div class="panel-head">
-              <h2>2. Merge commits from main</h2>
+              <h2 class="step-heading"><span class="step-number">2</span> Choose commits</h2>
               <div id="commitCount" class="badge">0 selected</div>
             </div>
+            <div class="section-kicker">Merge and direct commits from main</div>
             <div class="actions row">
               <button id="selectTopCommitsBtn" type="button">Select top 5</button>
               <button id="clearCommitsBtn" type="button">Clear</button>
+            </div>
+            <div class="commit-tools">
+              <input id="commitSearch" class="search-input" type="search" placeholder="Search SHA or message…" />
+              <div class="filter-group" aria-label="Commit type filter">
+                <button class="filter-btn active" type="button" data-filter="all">All</button>
+                <button class="filter-btn" type="button" data-filter="merge">Merge</button>
+                <button class="filter-btn" type="button" data-filter="direct">Direct</button>
+              </div>
             </div>
             <div id="coverageStatus" class="row small muted">Calculating selected-branch coverage…</div>
             <div id="commitsList" class="list"></div>
             <div class="row small muted">Commits already in all selected release branches are grayed out and auto-skipped.</div>
             <div class="row small muted">Missing one? Add extra SHA(s) manually.</div>
-            <textarea id="extraMergeCommits" placeholder="Extra merge commit SHA(s): space/comma/newline separated"></textarea>
+            <textarea id="extraMergeCommits" placeholder="Extra commit SHA(s): space/comma/newline separated"></textarea>
           </div>
         </div>
 
@@ -1369,9 +1552,13 @@ function renderHtml(instanceId) {
         </div>
 
         <div class="footer-actions">
+          <div class="selection-summary">
+            <div class="summary-icon">✓</div>
+            <div><div id="selectionSummary" class="summary-title">Ready to configure</div><div class="summary-sub">Review your selection before running</div></div>
+          </div>
           <div class="actions row">
-            <button id="runBtn" class="primary" type="button">Run release workflow</button>
-            <button id="reloadBtn" type="button">Reload branches/commits</button>
+            <button id="reloadBtn" type="button">↻ Refresh</button>
+            <button id="runBtn" class="primary" type="button">Run release workflow →</button>
           </div>
         </div>
       </div>
@@ -1408,6 +1595,8 @@ function renderHtml(instanceId) {
       const releaseNotesToggle = document.getElementById("releaseNotesToggle");
       const changeRepoBtn = document.getElementById("changeRepoBtn");
       const executionModeToggle = document.getElementById("executionModeToggle");
+      const commitSearch = document.getElementById("commitSearch");
+      const selectionSummary = document.getElementById("selectionSummary");
       let pushChanges = true;
       let generateReleaseNotes = true;
       let executionMode = "local";
@@ -1416,6 +1605,7 @@ function renderHtml(instanceId) {
       let selectedCommits = new Set();
       let allCommits = [];
       let coverageMap = {};
+      let commitFilter = "all";
 
       function escapeClient(value) {
         return String(value ?? "")
@@ -1546,6 +1736,10 @@ function renderHtml(instanceId) {
       function updateCounts() {
         branchCount.textContent = selectedBranches.size + " selected";
         commitCount.textContent = selectedCommits.size + " selected";
+        selectionSummary.textContent = selectedBranches.size + " branches · " + selectedCommits.size + " commits";
+        const ready = selectedBranches.size > 0 && selectedCommits.size > 0;
+        runBtn.disabled = !ready;
+        runBtn.title = ready ? "Run the configured backport" : "Select at least one branch and one commit";
       }
 
       function renderBranches(branches) {
@@ -1565,6 +1759,7 @@ function renderHtml(instanceId) {
           const chip = document.createElement("button");
           chip.type = "button";
           chip.className = "chip" + (selectedBranches.has(branch) ? " selected" : "");
+          chip.setAttribute("aria-pressed", String(selectedBranches.has(branch)));
           chip.textContent = branch;
           chip.addEventListener("click", async () => {
             if (selectedBranches.has(branch)) {
@@ -1583,12 +1778,18 @@ function renderHtml(instanceId) {
       function renderCommits(commits) {
         allCommits = commits.slice();
         commitsList.innerHTML = "";
-        if (!commits.length) {
-          commitsList.textContent = "No merge commits found on origin/main.";
+        const query = commitSearch.value.trim().toLowerCase();
+        const visibleCommits = commits.filter((commit) => {
+          const typeMatches = commitFilter === "all" || (commitFilter === "merge" ? commit.isMerge : !commit.isMerge);
+          const queryMatches = !query || commit.sha.toLowerCase().includes(query) || commit.subject.toLowerCase().includes(query);
+          return typeMatches && queryMatches;
+        });
+        if (!visibleCommits.length) {
+          commitsList.textContent = "No commits match the current filter.";
           updateCounts();
           return;
         }
-        for (const commit of commits) {
+        for (const commit of visibleCommits) {
           const coverage = coverageMap[commit.sha] || { coveredBranches: [], uncoveredBranches: [], fullyCovered: false };
           const disabled = coverage.fullyCovered;
           if (disabled) {
@@ -1596,12 +1797,15 @@ function renderHtml(instanceId) {
           }
 
           const card = document.createElement("div");
+          card.tabIndex = disabled ? -1 : 0;
+          card.setAttribute("role", "checkbox");
+          card.setAttribute("aria-checked", String(selectedCommits.has(commit.sha)));
           card.className = "commit-card" +
             (selectedCommits.has(commit.sha) ? " selected" : "") +
             (disabled ? " covered" : "");
           card.innerHTML =
             '<div class="commit-card-head">' +
-              '<div class="item-title"><span class="commit-sha">' + escapeClient(commit.sha.substring(0, 10)) + '</span> ' + escapeClient(commit.subject) + '</div>' +
+              '<div class="item-title"><span class="commit-type ' + (commit.isMerge ? '' : 'direct') + '">' + (commit.isMerge ? 'Merge' : 'Direct') + '</span><span class="commit-sha">' + escapeClient(commit.sha.substring(0, 10)) + '</span> ' + escapeClient(commit.subject) + '</div>' +
               '<div class="commit-cover-badge">' + coverage.coveredBranches.length + '/' + selectedBranches.size + ' branches</div>' +
             '</div>' +
             '<div class="item-subtitle muted small">' + escapeClient(commit.date) + '</div>';
@@ -1617,6 +1821,12 @@ function renderHtml(instanceId) {
             }
             renderCommits(allCommits);
           });
+          card.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              card.click();
+            }
+          });
           commitsList.appendChild(card);
         }
         updateCounts();
@@ -1627,7 +1837,7 @@ function renderHtml(instanceId) {
       }
 
       async function loadOptions() {
-        setLoading(true, "Loading branches and merge commits…");
+        setLoading(true, "Loading branches and commits…");
         try {
           const payload = await request("/api/options");
           if (payload.needsConfig) {
@@ -1726,8 +1936,8 @@ function renderHtml(instanceId) {
       function buildRunPayload() {
         return {
           branches: [...selectedBranches],
-          selectedMergeCommits: [...selectedCommits],
-          extraMergeCommits: document.getElementById("extraMergeCommits").value,
+          selectedCommits: [...selectedCommits],
+          extraCommits: document.getElementById("extraMergeCommits").value,
           pushChanges,
           generateReleaseNotes,
           executionMode,
@@ -1794,6 +2004,12 @@ function renderHtml(instanceId) {
       });
       selectTopCommitsBtn.addEventListener("click", () => setChecked(".commit-box", true, 5));
       clearCommitsBtn.addEventListener("click", () => setChecked(".commit-box", false));
+      commitSearch.addEventListener("input", () => renderCommits(allCommits));
+      document.querySelectorAll(".filter-btn").forEach((button) => button.addEventListener("click", () => {
+        commitFilter = button.dataset.filter;
+        document.querySelectorAll(".filter-btn").forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+        renderCommits(allCommits);
+      }));
       pushChangesToggle.addEventListener("click", () => {
         pushChanges = !pushChanges;
         pushChangesToggle.classList.toggle("on", pushChanges);
@@ -1808,7 +2024,7 @@ function renderHtml(instanceId) {
         executionMode = executionMode === "local" ? "online" : "local";
         executionModeToggle.classList.toggle("on", executionMode === "online");
         executionModeToggle.textContent = "Execution: " + (executionMode === "online" ? "GitHub Actions" : "Local");
-        runBtn.textContent = executionMode === "online" ? "Run online workflow" : "Run local workflow";
+        runBtn.textContent = executionMode === "online" ? "Run online workflow →" : "Run local workflow →";
       });
       changeRepoBtn?.addEventListener("click", showConfigPanel);
 
@@ -1818,7 +2034,7 @@ function renderHtml(instanceId) {
 </html>`;
 }
 
-async function startServer(instanceId) {
+async function startServer(instanceId, requestedPort = 0) {
     const server = createServer(async (req, res) => {
         try {
             if (req.method === "GET" && req.url === "/api/options") {
@@ -1900,12 +2116,30 @@ async function startServer(instanceId) {
         }
     });
 
-    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(requestedPort, "127.0.0.1", resolve);
+    });
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : 0;
     return { server, url: `http://127.0.0.1:${port}/` };
 }
 
+const standalone = process.argv.includes("--standalone");
+const portArgument = process.argv.find((argument) => argument.startsWith("--port="));
+const standalonePort = portArgument ? Number.parseInt(portArgument.slice("--port=".length), 10) : 3000;
+
+if (standalone) {
+  await loadConfig();
+  const entry = await startServer("standalone", Number.isInteger(standalonePort) ? standalonePort : 3000);
+  console.log(`Release Manager läuft unter ${entry.url}`);
+  console.log("Beenden mit Ctrl+C");
+
+  const closeServer = () => entry.server.close(() => process.exit(0));
+  process.once("SIGINT", closeServer);
+  process.once("SIGTERM", closeServer);
+} else {
+const { joinSession, createCanvas } = await import("@github/copilot-sdk/extension");
 const _session = await joinSession({
     canvases: [
         createCanvas({
@@ -1915,16 +2149,16 @@ const _session = await joinSession({
             actions: [
                 {
                     name: "run_release_workflow",
-                    description: "Dispatch ReleaseManager.yaml with selected merge commits and release branches.",
+                  description: "Dispatch ReleaseManager.yaml with selected merge or direct commits and release branches.",
                     inputSchema: {
                         type: "object",
                         additionalProperties: false,
                         properties: {
-                            selectedMergeCommits: {
+                            selectedCommits: {
                                 type: "array",
                                 items: { type: "string" },
                             },
-                            extraMergeCommits: { type: "string" },
+                            extraCommits: { type: "string" },
                             branches: {
                                 type: "array",
                                 items: { type: "string" },
@@ -2005,3 +2239,4 @@ const _session = await joinSession({
 // We rely on the config file or the user setting it via the UI instead.
 await loadConfig();
 _session.log(`Release Manager (user-scope): repo = ${_repoRoot || "(not configured — open canvas to set path)"}`, { ephemeral: true });
+}
