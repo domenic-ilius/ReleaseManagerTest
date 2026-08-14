@@ -304,7 +304,9 @@ jobs:
             Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Manual approval required before pushing`nReview each preview branch in this run, then approve the 'release-push-approval' environment to continue."
           }
 
-          $resultsJson = @($results) | ConvertTo-Json -Depth 8 -Compress
+          # Use -InputObject so PowerShell does not unwrap a single-item array
+          # through the pipeline. GitHub's matrix requires a JSON array here.
+          $resultsJson = ConvertTo-Json -InputObject @($results) -Depth 8 -Compress
           $encodedResults = $resultsJson -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "results=$encodedResults"
           Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "hadFailures=$hadFailures"
